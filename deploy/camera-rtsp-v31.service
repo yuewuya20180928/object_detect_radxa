@@ -1,0 +1,36 @@
+[Unit]
+Description=Camera RTSP pipeline v31 (Allwinner A733, V4L2 + OD + x264enc + RTSP server, ALL C++)
+After=network-online.target multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=radxa
+Group=radxa
+WorkingDirectory=/home/radxa
+
+Environment=NPU_MODEL=/etc/npu/yolov5/model/yolov5.nb
+Environment=LD_LIBRARY_PATH=/home/radxa/od_api/lib:/home/radxa/ai-sdk/viplite-tina/lib/aarch64-none-linux-gnu/v2.0
+
+ExecStart=/usr/bin/env NPU_MODEL=/etc/npu/yolov5/model/yolov5.nb LD_LIBRARY_PATH=/home/radxa/od_api/lib:/home/radxa/ai-sdk/viplite-tina/lib/aarch64-none-linux-gnu/v2.0  /home/radxa/v31_v4l2_od_rtsp /dev/video0 640 480 2 60
+
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+CPUQuota=200%
+MemoryMax=2G
+TasksMax=256
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=camera-rtsp-v31
+
+NoNewPrivileges=false
+PrivateTmp=false
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
