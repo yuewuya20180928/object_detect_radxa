@@ -903,6 +903,20 @@ D. ACUITY 6.30.22 + 正确 chip ID flag 重导完整 README + 上传 INT8 .nb �
 - **atomic<int>::fetch_add 失败**: 代码生成 (__aarch64_ldadd4_acq_rel) 对, 但运行时仍每帧 OD — 可能 atomic {0} brace-init 在某些情况下不调 atomic_store, od_c 一直 0 → mod 0 == 0 总成立 → 每帧 OD
 - **教训**: 单线程下别用 std::atomic, 用 volatile int 简单可靠
 
+**【铁律】uvc/UAC 等 USB device class: descriptor 的 capability 不是 actual performance**（2026-09-19 实测挨批）
+- Microdia 0c45:6340 UVC 报 "max 30 fps" capability（lsusb dwFrameInterval 列 6 个值 30/25/20/15/10/5）
+- 实测只跑 13-18 fps（auto-exposure 锁在 ~54ms interval = 18.5 fps 上限）
+- **没查 datasheet 就下结论 "sensor 物理上限 15fps" 是错的**（老板 push 查手册后才找到 UVC FAQ 真根因）
+- 正确流程: 任何 "X 是物理上限" 类结论前, 必须:
+  1. 查 vendor 官方 datasheet / UVC class spec / driver quirks table
+  2. 开 `uvcvideo trace=0xffff` 看 PROBE/COMMIT 实际 dwFrameInterval
+  3. 实测变环境变量 (光照/负载) 看 fps 是否响应, 排除 firmware vs hardware
+- 不要直接信 "v4l2-ctl --get-parm" 报的值（报的是 max，不是协商 actual）
+
+**【铁律】老板 push 查手册时必须真去查, 不要用 "查不到" 搪塞**（2026-09-19）
+- 第一轮我说 "Microdia 不公开 datasheet, 查不到", 老板 push 后才发现 UVC FAQ ideasonboard.org 有完整说明
+- 查不到 ≠ 没资料, 先 web_search + web_fetch 多源试, 实在查不到才说
+
 ### 8-13 笔记：libod_helper.so post-process 实际输出格式
 - workspace 旧注释: `yolov5_post_process_bgr` 输出 `"%2d: %3.0f%%, [%4.0f, %4.0f, %4.0f, %4.0f], %s\n"` (label: conf%, [x1,y1,x2,y2], class_name)
 - **实测 `strings libod_helper.so`**: 只有 `"detection num: %d"` 一行格式
@@ -1089,3 +1103,61 @@ ExecStart=... /home/radxa/v31_v4l2_od_rtsp /dev/video0 640 480 2 86400 /etc/npu/
     - 9-3 推荐 fine-tune 你场景 → 老板指出是单点解, catastrophic forgetting 破坏 80 类 (方案错)
     - 今晚 person/cat/dog 抖动 → 我列了 5 种可能但没逐个验证就给"换 backbone"方案 (流程错)
   - **check list**: 任何 troubleshooting 类问题, 先问"根因明确吗", 不明确就进上面 4 步流程, 明确才能定措施
+
+## 2026-10-11 15:30 — 新铁律 (架构 A + OD 优化)
+
+### 架构 A — OD 独立 worker thread (老板决策)
+- **【铁律】OD-bound 系统: 拆 OD 独立 thread, main 不等 OD, fps 拉满 camera ceiling** (2026-10-11 老板拍板, 源于今晚 v31 19.83 fps OD-bound 优化)
+  - **场景**: 单线程 main loop 中 OD pipeline (NPU inference + decode + nms) 总耗时 35-44ms / 帧, camera 30fps 但 fps 上限被 OD 拖到 19.83
+  - **架构**:
+    ```
+    main (capture + push):              worker_thread (OD):
+    ===================                ===========================
+    while: while:
+      DQBUF                               wait q_frame
+      cvtColor → bgr                       pre_process (libod_helper.so)
+      push q_frame (bgr.clone ~0.5ms)     awnn_set_input_buffers
+      pop q_result last (timeout 0)       awnn_run (35ms ★)
+      draw last_det on bgr                 awnn_get_output_buffers
+      push appsrc                          yolov5_decode_all + yolov5_nms
+      QBUF                                 push q_result → main
+    ```
+  - **预期 + 实测**: fps 19.83 → **29.78** (camera-bound, 拉满 camera ceiling 29.82)
+  - **关键决策**:
+    - q_frame max=2 (drop oldest backpressure, OD 永远算最新帧)
+    - q_result max=1 (try_pop_latest, main 只用 last_det)
+    - bgr 必须 clone (避免 OD 算时 main 改写 race), 0.5ms 开销可接受
+  - **跟 9/19 MT 区别**: 9/19 MT 拆 capture/process 两线程同步 pipeline (camera 实际只 15fps 退步 -1%); 架构 A 是 OD 异步拆分 (camera 满 30fps 时 fps +50%)
+  - **det 显示**: 永远晚 1 帧 (33ms) + 偶尔不更新 (OD 慢 17% 时新帧覆盖旧)
+  - **老板约束**: "为了保证检测的效果是不可能隔帧检测的" → 否决 OD_SKIP 方案
+  - **代码模式**:
+    - FrameQueueT<T> 模板 (push_drop_oldest / wait_pop / try_pop_latest + cv_not_empty + mutex)
+    - DetectorWorker class 接受 ctx + W + H + stderr_file + 5 个 libod_helper 函数指针 + q_frame_max
+    - main loop 不等 OD, push q_frame (clone bgr) + pop last_det + draw
+  - **check list**: OD-bound system 优化时, 第一时间考虑架构 A (OD 异步), 不优先 OD_SKIP/NPU 加速
+
+- **【铁律】Ring buffer / lock-free queue 引入同步依赖, OD 慢时退步 fps** (2026-10-11 实测教训)
+  - 试 BgrRing class (3 slots, mutex + cv, acquire/release) 替代 bgr.clone() zero-copy
+  - 实测 fps **24.5** (退步 5fps, 从 29.66 跌)
+  - **根因**: OD 慢 17% (worker 36ms vs main 33ms), ring 满, main acquire 阻塞 12-56ms 等 OD release → main 退化成同步模式
+  - **教训**: ring buffer 只有在 OD ≥ capture 节奏时才行, 否则 backpressure 反向拖累
+  - **替代方案**: bgr.clone() 0.5ms 是最低开销方案, ring buffer 只在 OD 永远不慢于 capture 时才有 ROI
+  - **check list**: 加 queue/backpressure 前算 OD 跟 main 节奏差, 慢 ≥5% 时不要用 blocking acquire
+
+- **【铁律】RTSP SDP framerate 必须跟实际 fps 匹配** (2026-10-11 修, 旧 bug 自 8/13)
+  - 老 `g_state.FPS = 14` + 3 处 caps `framerate=14/1` (8/13 留的, 当时实际 14 fps)
+  - 实际 fps 涨到 30 后, VLC/mpv 按 14fps 设计 buffer, 永远吃不满, spike 直接体现在画面
+  - 修法: 改 `g_state.FPS` + 同步 caps 跟 launch string, 3 处必须一起改 (appsrc caps / capsfilter I420 / capsfilter H.264)
+  - **check list**: 任何 fps 性能调优后必须同步 SDP, 跑 VLC/mpv 验证 buffer 设计正确
+
+- **【铁律】Deli 1080P USB camera ceiling 30fps vs Microdia 15fps** (2026-10-11 实测)
+  - 老板换了 Deli 1080P Camera (3001:4034) 替换之前的 Microdia
+  - 实测 capture ceiling: **29.82 fps** (vs Microdia 15fps), +50% camera 硬件提升
+  - Deli 6 种 format 实测 (USB2 限速):
+    - YUYV 640x480 → 29.82 fps (camera 上限)
+    - MJPG 全 res → 30 fps (JPEG 压缩摆脱 USB2 带宽)
+    - YUYV 800x600 → 19.87 fps (USB2 18MB/s 带宽)
+    - YUYV 1280x720 → 9.94 fps
+    - YUYV 1920x1080 → 4.97 fps
+  - NPU input 永远 640x640 letterbox (不管 camera res), 所以 OD timing 跟 res 无关
+  - **check list**: 摄像头换新后第一时间测 ENUM_FMT + capture ceiling, 跟旧摄像头对比 ROI

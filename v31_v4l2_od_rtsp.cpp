@@ -30,6 +30,12 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>  // 2026-08-13 debug: cv::imencode for /tmp/v31_last.jpg
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <utility>
 #include <cmath>  // 2026-08-14: expf for yolov5 decode
 #include <algorithm>  // 2026-08-14: max_element for yolov5 decode + NMS
 #include <vector>  // 2026-08-14: detection boxes
@@ -56,53 +62,26 @@ static const char* YOLO_CLASSES[80] = {
     "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
     "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
 };
-// 2026-08-17: yolov8 decode constants (anchor-free)
-// output0 单 tensor shape (1, 6, 8400), 内存 NCHW
-//   channel 0..3: cx, cy, w, h (已含 grid*stride, 640x640 letterbox 坐标, float)
-//   channel 4: cls0 score (sigmoid'd, person) [0, 1]
-//   channel 5: cls1 score (sigmoid'd, not_person) [0, 1]
-// 8400 = 80*80 + 40*40 + 20*20 (anchor-free, 1 anchor per grid cell)
-static const int YOLOV8_NUM_CLASSES = 2;
-static const char* YOLOV8_CLASSES[2] = {"person", "not_person"};
-static const int YOLOV8_TOTAL_ANCHORS = 8400;
 // 2026-08-14: conf/iou 阈值 改全局变量, 从 main() argv 传入
 static float YOLO_CONF_THRESH = 0.55f;  // 2026-08-14 00:30: 调高过滤假噪声
-static float YOLO_IOU_THRESH = 0.55f;  // 2026-08-14 v36.2: 改回 0.55 (IoU 0.30/0.45 实验导致漏检)
-// 2026-08-14 22:50 v35 误识别过滤: per-class conf + edge/area filter
-// 老板客厅场景实测: 真人 47% 在中心, 但衣架/衣服/杂物 41-52% 在边缘
-// 单 conf 阈值没法区分 → 加 3 层过滤
-// 2026-08-14 23:05 v35.1: 调回宽松 (v35 漏检太狠, 老板姿势微变就只剩 1 个 42% 袖子)
-//   - person conf 0.40 → 0.35 (保弱 anchor)
-//   - edge 5% → 3% (放宽边缘)
-//   - area max 70% → 80% (保大框)
-//   - 新增 top-3 box 限制 (不管 conf, 每帧最多画 3 个最强)
-// 2026-08-14 23:50 v36: B+D 迭代
-//   B. class 黑名单 - ban 室内常误识别类 (伞/包/领带/椅子/沙发/盆栽/餐桌/马桶/书)
-//   D. 同 class NMS IoU 0.55 → 0.30 - 让 face+collar 重叠的 person 合并成 1 个
-// 2026-08-15 v37: 老板反馈 v35.1 还有多余 person 框 (雨伞+墙 46%, 金属碗 40%)
-//   - person conf 0.35 → 0.45 (杀 40-46% 误识别, 保留真人 42%+)
-//   - top-K 3 → 1 (只画 1 个最强, 真人 conf 几乎总是最高, 不怕漏)
-// 2026-08-15 v38: 加 5 帧 temporal voting
-//   - 真人每帧都在 (同一个位置) → hit_count 累积, 通过
-//   - 假阳性随机位置 → 1-2 帧 hit, 被过滤
-//   - hit_count >= 3/5 才画
-#define TEMPORAL_WINDOW 5      // 看最近 5 帧
-#define TEMPORAL_VOTES 3       // 至少 3 帧命中才算稳定
-#define TEMPORAL_MAX_DIST 80.0f  // 同框距离阈值 (中心 < 80px 算同一框)
-#define TEMPORAL_TRACKS 2      // 同时跟踪 2 条轨迹 (真人 + 偶尔另一稳定目标)
-static float PERSON_CONF_THRESH = 0.45f;  // person 类敏感, 保留真人 (含 45%+ 弱 anchor)
-static float OTHER_CONF_THRESH = 0.65f;   // 其他类严格, 杀 cell phone/椅子误识别
-static float MIN_BOX_AREA_RATIO = 0.008f; // < 0.8% 噪点 reject
-static float MAX_BOX_AREA_RATIO = 0.80f;  // > 80% 全框 reject (墙/窗帘)
-static float EDGE_MARGIN_RATIO = 0.03f;   // 3% 边缘内 reject
-static int MAX_BOX_PER_FRAME = 1;         // 每帧最多画 1 个 (top-1 by conf)
-// 2026-08-14 v36.2: 黑名单简化, 只 ban 56=chair (最常误识别), 其他全保留
-// v36 10 个 ban class 实验失败 (0 框), 推测 NPU 内部算法 + 边界条件耦合导致 person anchor 被误杀
-static const int BLACKLIST_CLASSES[] = {56};
-static const int BLACKLIST_NUM = sizeof(BLACKLIST_CLASSES) / sizeof(BLACKLIST_CLASSES[0]);
+static float YOLO_IOU_THRESH = 0.60f;
 static int OD_SKIP = 1;  // 每 N 帧做一次 OD, 默认 1 (每帧)
 static const int YOLO_INPUT_W = 640;
 static const int YOLO_INPUT_H = 640;
+
+// 2026-09-06 23:25 RCA: 易混淆类 top-K logit dump (验证水杯→cup/bottle/remote/vase 跨帧跳变根因)
+// 用 printf(stdout) → journald (不能用 fprintf(stderr),会被 dup2 + TRUNC)
+static const int TOPK_TARGET_CLASSES[] = {41, 39, 65, 75, 60};
+static const char* TOPK_TARGET_NAMES[] = {"cup", "bottle", "remote", "vase", "table"};
+static const int TOPK_TARGET_NUM = sizeof(TOPK_TARGET_CLASSES) / sizeof(TOPK_TARGET_CLASSES[0]);
+
+// 2026-09-06 23:48 RCA 修复: 圆柱形类 (cylindrical) 特殊处理
+//   NPU INT8 obj head 量化损失 (sig max 0.46) 导致 score=obj*cls_prob 卡阈值边界
+//   cylindrical 类 (cup/bottle/vase/wine glass) 改用 score=cls_prob + 阈 0.40
+//   person + 其他 73 类 完全不动, 走原 obj*cls_prob + 阈 0.20 路径
+static const int CYL_CLASSES[] = {39, 40, 41, 75};  // bottle, wine glass, cup, vase
+static const int CYL_NUM = sizeof(CYL_CLASSES) / sizeof(CYL_CLASSES[0]);
+static const float CYL_CONF_THRESH = 0.40f;  // cylindrical 类单独阈值 (cls_prob 维度)
 
 struct DetBox {
     float x1, y1, x2, y2;
@@ -126,7 +105,6 @@ static float iou_xyxy(const DetBox& a, const DetBox& b) {
 // 2026-08-14: 从 NPU 3 个 output tensor 解码出所有 detection (640x640 letterbox 坐标)
 // NPU output 布局 (NHWC): [grid_y, grid_x, anchor_idx, 85]
 // 85 = [x_logit, y_logit, w_logit, h_logit, obj_logit, cls0_logit, ..., cls79_logit]
-// 2026-08-14 22:50 v35: 加 per-class conf + edge/area filter
 static void yolov5_decode_all(void** outputs, int orig_w, int orig_h, std::vector<DetBox>& out_dets) {
     out_dets.clear();
     for (int s = 0; s < 3; s++) {
@@ -136,13 +114,11 @@ static void yolov5_decode_all(void** outputs, int orig_w, int orig_h, std::vecto
         for (int gy = 0; gy < gs; gy++) {
             for (int gx = 0; gx < gs; gx++) {
                 for (int a = 0; a < YOLO_NUM_ANCHORS; a++) {
-                    int idx = (gy * gs + gx) * YOLO_NUM_ANCHORS * 85 + a * 85;
+                    int idx = (a * gs * gs + gy * gs + gx) * 85;
                     float* anch = out + idx;
                     // obj sigmoid
                     float obj = 1.0f / (1.0f + expf(-anch[4]));
-                    // 2026-08-14 v35: per-class conf 阈值 (person 敏感, 其他严格)
-                    float obj_thresh = (anch[5+0] > anch[5+2]) ? PERSON_CONF_THRESH : OTHER_CONF_THRESH;
-                    if (obj < obj_thresh) continue;
+                    if (obj < YOLO_CONF_THRESH) continue;
                     // 找最大 class prob
                     int best_cls = -1;
                     float best_cls_logit = -1e9f;
@@ -151,15 +127,23 @@ static void yolov5_decode_all(void** outputs, int orig_w, int orig_h, std::vecto
                         if (v > best_cls_logit) { best_cls_logit = v; best_cls = c; }
                     }
                     float cls_prob = 1.0f / (1.0f + expf(-best_cls_logit));
-                    float score = obj * cls_prob;
-                    // 2026-08-14 v36: blacklisted class 直接 skip (不浪费 NMS 资源)
-                    bool blacklisted = false;
-                    for (int b = 0; b < BLACKLIST_NUM; b++) {
-                        if (best_cls == BLACKLIST_CLASSES[b]) { blacklisted = true; break; }
+                    // 2026-09-06 23:48 RCA 修复: cylindrical 类 (cup/bottle/vase/wine glass) 用 cls_prob 路径
+                    //   NPU INT8 obj head 量化后 sig 最大 0.46, 跟 cls_prob 相乘后 score 卡阈值
+                    //   cylindrical 类 cls_prob 强 (cup sig 0.72-0.91 跨帧稳定), 扔掉弱 obj
+                    //   person + 其他类完全不动, 仍走 obj*cls_prob + 0.20 阈值
+                    bool is_cyl = false;
+                    for (int cc = 0; cc < CYL_NUM; cc++) {
+                        if (best_cls == CYL_CLASSES[cc]) { is_cyl = true; break; }
                     }
-                    if (blacklisted) continue;
-                    // 2026-08-14 v35: 实际 class 决定 conf 阈值
-                    float cls_thresh = (best_cls == 0) ? PERSON_CONF_THRESH : OTHER_CONF_THRESH;
+                    float score;
+                    float cls_thresh;
+                    if (is_cyl) {
+                        score = cls_prob;
+                        cls_thresh = CYL_CONF_THRESH;  // 0.40
+                    } else {
+                        score = obj * cls_prob;
+                        cls_thresh = YOLO_CONF_THRESH;  // 0.20
+                    }
                     if (score < cls_thresh) continue;
                     // yolov5 decode box
                     float x_logit = anch[0];
@@ -174,13 +158,6 @@ static void yolov5_decode_all(void** outputs, int orig_w, int orig_h, std::vecto
                     box.x1 = xc - w/2; box.y1 = yc - h/2;
                     box.x2 = xc + w/2; box.y2 = yc + h/2;
                     box.score = score; box.class_id = best_cls;
-                    // 2026-08-14 v35: 面积过滤 (杀全框/噪点)
-                    float box_w = box.x2 - box.x1;
-                    float box_h = box.y2 - box.y1;
-                    float area_ratio = (box_w * box_h) / (orig_w * orig_h);
-                    if (area_ratio < MIN_BOX_AREA_RATIO || area_ratio > MAX_BOX_AREA_RATIO) {
-                        continue;  // 太小的噪点 或 太大的全框
-                    }
                     out_dets.push_back(box);
                 }
             }
@@ -190,7 +167,6 @@ static void yolov5_decode_all(void** outputs, int orig_w, int orig_h, std::vecto
 
 // 2026-08-14: NMS (按 class 分组)
 // 输入 out_dets (640x640 letterbox 坐标), 输出 nms_dets
-// 2026-08-14 v36: 默认 IoU 阈值 0.55→0.30, 让 face+collar 重叠 person 合并
 static void yolov5_nms(std::vector<DetBox>& dets, std::vector<DetBox>& nms_dets) {
     nms_dets.clear();
     std::sort(dets.begin(), dets.end(), [](const DetBox& a, const DetBox& b) { return a.score > b.score; });
@@ -203,65 +179,36 @@ static void yolov5_nms(std::vector<DetBox>& dets, std::vector<DetBox>& nms_dets)
     }
 }
 
-// 2026-08-17: yolov8 decode - 单 output0 tensor
-// 2026-08-17 修正: NPU 输出 NHWC (1, 8400, 6) 不是 NCHW (1, 6, 8400)
-//   NPU  dim 8400 6 1 => 内存顺序 out[i*6 + 0..5]
-//     out[i*6 + 0] = anchor i 的 cx (pixel, 640x640 letterbox)
-//     out[i*6 + 1] = anchor i 的 cy
-//     out[i*6 + 2] = anchor i 的 w
-//     out[i*6 + 3] = anchor i 的 h
-//     out[i*6 + 4] = anchor i 的 cls0 score (person, sigmoid'd)
-//     out[i*6 + 5] = anchor i 的 cls1 score (not_person, sigmoid'd)
-// 8400 = 80*80 + 40*40 + 20*20 (anchor-free, 无 anchor box)
-// PC 端 onnx 输出是 NCHW, 但 pegasus/od 部署后重排为 NHWC → NPU 输出为 NHWC
-// 复用现有 per-class conf + area filter + NMS + letterbox_inverse + draw
-static void yolov8_decode_all(void** outputs, int orig_w, int orig_h, std::vector<DetBox>& out_dets) {
-    out_dets.clear();
-    float* out = (float*)outputs[0];
-    for (int i = 0; i < YOLOV8_TOTAL_ANCHORS; i++) {
-        // NHWC layout: 6 个值连续存放
-        float cx = out[i * 6 + 0];
-        float cy = out[i * 6 + 1];
-        float w  = out[i * 6 + 2];
-        float h  = out[i * 6 + 3];
-        float logit_cls0 = out[i * 6 + 4];  // person raw logit
-        float logit_cls1 = out[i * 6 + 5];  // not_person raw logit
-        // 2026-08-17: NPU 输出是 INT8 反量化后的 raw logits (不是 sigmoid'd probability)
-        // logit 范围 -inf ~ +inf, sigmoid 后才是 0~1
-        // sigmoid(x) = 1 / (1 + exp(-x))
-        float score_cls0 = 1.0f / (1.0f + expf(-logit_cls0));
-        float score_cls1 = 1.0f / (1.0f + expf(-logit_cls1));
-        // 选最大 class
-        int best_cls;
-        float score;
-        if (score_cls0 >= score_cls1) {
-            best_cls = 0;
-            score = score_cls0;
-        } else {
-            best_cls = 1;
-            score = score_cls1;
+// 2026-09-06 23:48 RCA 修复: cylindrical 类间 NMS (cup/bottle/vase/wine glass)
+//   同位置 IoU > 0.5 的 cylindrical 多类 → 只留 score 最高的, 其余标 score=-1 杀掉
+//   person + 其他类完全不受影响 (只处理 cylindrical 类)
+//   解决: cup/bottle/vase/remote 同 anchor 重复检测 / 嵌套框问题
+static void cyl_iou_nms(std::vector<DetBox>& dets) {
+    for (size_t i = 0; i < dets.size(); i++) {
+        bool i_is_cyl = false;
+        for (int cc = 0; cc < CYL_NUM; cc++) {
+            if (dets[i].class_id == CYL_CLASSES[cc]) { i_is_cyl = true; break; }
         }
-        // per-class conf 阈值 (复用全局变量)
-        float thresh = (best_cls == 0) ? PERSON_CONF_THRESH : OTHER_CONF_THRESH;
-        if (score < thresh) continue;
-        // area filter (噪点 + 全框)
-        float area_ratio = (w * h) / (float)(orig_w * orig_h);
-        if (area_ratio < MIN_BOX_AREA_RATIO || area_ratio > MAX_BOX_AREA_RATIO) continue;
-        DetBox box;
-        box.x1 = cx - w * 0.5f;
-        box.y1 = cy - h * 0.5f;
-        box.x2 = cx + w * 0.5f;
-        box.y2 = cy + h * 0.5f;
-        box.score = score;
-        box.class_id = best_cls;
-        out_dets.push_back(box);
+        if (!i_is_cyl) continue;
+        for (size_t j = 0; j < dets.size(); j++) {
+            if (i == j) continue;
+            bool j_is_cyl = false;
+            for (int cc = 0; cc < CYL_NUM; cc++) {
+                if (dets[j].class_id == CYL_CLASSES[cc]) { j_is_cyl = true; break; }
+            }
+            if (!j_is_cyl) continue;
+            float iou = iou_xyxy(dets[i], dets[j]);
+            if (iou > 0.5f && dets[i].score < dets[j].score) {
+                dets[i].score = -1.0f;  // 标记拒绝
+                break;
+            }
+        }
     }
 }
 
 // 2026-08-14: letterbox inverse - 从 640x640 还原到原始 640x480 BGR
 // yolov5 letterbox: scale = min(model_w/img_w, model_h/img_h) = min(640/640, 640/480) = 1.0
 // new_size = (640, 480), pad = (0, 80) (40 top + 40 bottom)
-// 2026-08-14 22:50 v35: 加 edge filter (杀墙/衣架/角落框)
 static void letterbox_inverse(int orig_w, int orig_h, DetBox& box) {
     float scale = std::min((float)YOLO_INPUT_W/orig_w, (float)YOLO_INPUT_H/orig_h);
     int new_w = (int)(orig_w * scale);
@@ -277,28 +224,15 @@ static void letterbox_inverse(int orig_w, int orig_h, DetBox& box) {
     box.y1 = std::max(0.0f, std::min((float)orig_h, box.y1));
     box.x2 = std::max(0.0f, std::min((float)orig_w, box.x2));
     box.y2 = std::max(0.0f, std::min((float)orig_h, box.y2));
-    // 2026-08-14 v35: 边缘过滤 - 框任一边在 EDGE_MARGIN_RATIO 范围内 → reject (在 call site 判断, 这里只算)
-    // 用 box 中心判断 (避免大框边缘接触但中心在中间的情况)
-    float cx = (box.x1 + box.x2) / 2.0f;
-    float cy = (box.y1 + box.y2) / 2.0f;
-    float mx = EDGE_MARGIN_RATIO * orig_w;
-    float my = EDGE_MARGIN_RATIO * orig_h;
-    if (cx < mx || cx > orig_w - mx || cy < my || cy > orig_h - my) {
-        box.score = -1.0f;  // 标记为 reject (call site 检查 score < 0)
-    }
 }
 
 // 2026-08-14: 在 BGR 帧上画检测框 + 标签
-// 2026-08-17: 加 is_yolov8 参数 切换 class 标签 (80 COCO vs 2 person/not_person)
-static void draw_detections(cv::Mat& img, const std::vector<DetBox>& dets, bool is_yolov8) {
+static void draw_detections(cv::Mat& img, const std::vector<DetBox>& dets) {
     for (auto& d : dets) {
         cv::rectangle(img, cv::Point((int)d.x1, (int)d.y1), cv::Point((int)d.x2, (int)d.y2),
                       cv::Scalar(0, 255, 0), 2);
         char label[128];
-        const char* name = is_yolov8
-            ? (d.class_id < YOLOV8_NUM_CLASSES ? YOLOV8_CLASSES[d.class_id] : "?")
-            : (d.class_id < YOLO_NUM_CLASSES ? YOLO_CLASSES[d.class_id] : "?");
-        snprintf(label, sizeof(label), "%s %.0f%%", name, d.score * 100);
+        snprintf(label, sizeof(label), "%s %.0f%%", YOLO_CLASSES[d.class_id], d.score * 100);
         int baseline = 0;
         cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
         // 背景黑条
@@ -317,6 +251,15 @@ static void draw_detections(cv::Mat& img, const std::vector<DetBox>& dets, bool 
 #include <gst/rtsp-server/rtsp-server.h>
 
 // libod_helper.so C API
+
+
+// =========================================================================
+// 2026-10-11 优化 2: BgrRing zero-copy shared BGR buffer (替代 bgr.clone())
+//   main 拿 free slot 写 cvtColor, push frame (只传 idx)
+//   worker 算 OD 完 release slot, main 才能 reuse
+//   ring size = 3 (main 1, OD 1, free 1, 不阻塞)
+// =========================================================================
+// libod_helper.so C API
 typedef void* (*t_awnn_create)(const char*);
 typedef void (*t_awnn_init)(void);
 typedef void* (*t_yolov5_pre_process_bgr)(const unsigned char*, int, int, unsigned int*);
@@ -324,6 +267,141 @@ typedef int (*t_yolov5_post_process_bgr)(void**, int, int);
 typedef void (*t_awnn_set_input_buffers)(void*, void**);
 typedef void (*t_awnn_run)(void*);
 typedef void** (*t_awnn_get_output_buffers)(void*);
+
+// =========================================================================
+// 2026-10-11 架构 A MVP: OD 独立 worker thread
+// =========================================================================
+
+struct FrameTask {
+    std::shared_ptr<cv::Mat> bgr;     // bgr clone (避免 OD 算时 main 改写)
+    uint64_t frame_id = 0;
+    struct timespec capture_ts{};
+};
+
+struct DetResult {
+    std::vector<DetBox> dets;
+    uint64_t frame_id = 0;
+};
+
+// 通用 thread-safe 队列, 支持 drop_oldest / wait_pop / try_pop_latest
+template <typename T>
+class FrameQueueT {
+    std::mutex m_;
+    std::condition_variable cv_not_empty_;
+    std::deque<T> q_;
+    size_t max_size_;
+    std::atomic<bool> stop_{false};
+public:
+    FrameQueueT(size_t max_size=2) : max_size_(max_size) {}
+    void stop() {
+        std::lock_guard<std::mutex> lk(m_);
+        stop_.store(true);
+        cv_not_empty_.notify_all();
+    }
+    void push_drop_oldest(T t) {
+        std::lock_guard<std::mutex> lk(m_);
+        while (q_.size() >= max_size_) q_.pop_front();
+        q_.push_back(std::move(t));
+        cv_not_empty_.notify_one();
+    }
+    T wait_pop() {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_not_empty_.wait(lk, [this]{return !q_.empty() || stop_.load();});
+        if (stop_.load() && q_.empty()) return T{};
+        T t = std::move(q_.front()); q_.pop_front();
+        return t;
+    }
+    bool try_pop_latest(T& out) {
+        std::lock_guard<std::mutex> lk(m_);
+        if (q_.empty()) return false;
+        out = std::move(q_.back());
+        q_.clear();
+        return true;
+    }
+    size_t size() { std::lock_guard<std::mutex> lk(m_); return q_.size(); }
+};
+
+// OD 独立 worker thread, 跑 pre + awnn_run + decode + nms
+class DetectorWorker {
+    FrameQueueT<FrameTask> q_frame_;
+    FrameQueueT<DetResult> q_det_result_;
+    std::thread thread_;
+    std::atomic<bool> running_{false};
+    void* ctx_;
+    int W_, H_;
+    const char* stderr_file_;
+    t_yolov5_pre_process_bgr pre_fn_;
+    t_yolov5_post_process_bgr post_fn_;
+    t_awnn_set_input_buffers setin_fn_;
+    t_awnn_run run_fn_;
+    t_awnn_get_output_buffers getout_fn_;
+public:
+    DetectorWorker(void* ctx, int W, int H, const char* stderr_file,
+                   t_yolov5_pre_process_bgr pre_fn,
+                   t_yolov5_post_process_bgr post_fn,
+                   t_awnn_set_input_buffers setin_fn,
+                   t_awnn_run run_fn,
+                   t_awnn_get_output_buffers getout_fn,
+                   size_t q_frame_max=2)
+        : q_frame_(q_frame_max), q_det_result_(1),
+          ctx_(ctx), W_(W), H_(H), stderr_file_(stderr_file),
+          pre_fn_(pre_fn), post_fn_(post_fn), setin_fn_(setin_fn),
+          run_fn_(run_fn), getout_fn_(getout_fn) {}
+    void start() {
+        running_.store(true);
+        thread_ = std::thread([this]{ run_loop(); });
+    }
+    void stop() {
+        running_.store(false);
+        q_frame_.stop();
+        if (thread_.joinable()) thread_.join();
+    }
+    auto& q_frame() { return q_frame_; }
+    auto& q_det_result() { return q_det_result_; }
+
+    void run_loop() {
+        while (running_.load()) {
+            FrameTask task = q_frame_.wait_pop();
+            if (!running_.load()) break;
+            if (!task.bgr || task.bgr->empty()) continue;
+            std::vector<DetBox> nms_dets;
+            fflush(stderr);
+            int saved = dup(STDERR_FILENO);
+            int tmp_fd = open(stderr_file_, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            dup2(tmp_fd, STDERR_FILENO);
+            close(tmp_fd);
+            unsigned int in_size = 0;
+            void* in_buf = pre_fn_(task.bgr->data, W_, H_, &in_size);
+            if (in_buf) {
+                void* ib = in_buf;
+                setin_fn_(ctx_, &ib);
+                run_fn_(ctx_);
+                void** outputs = getout_fn_(ctx_);
+                if (outputs) {
+                    post_fn_(outputs, W_, H_);
+                    fflush(stderr);
+                    std::vector<DetBox> all_dets;
+                    yolov5_decode_all(outputs, W_, H_, all_dets);
+                    yolov5_nms(all_dets, nms_dets);
+                    cyl_iou_nms(nms_dets);
+                    nms_dets.erase(std::remove_if(nms_dets.begin(), nms_dets.end(),
+                        [](const DetBox& d) { return d.score < 0.0f; }), nms_dets.end());
+                    for (auto& d : nms_dets) letterbox_inverse(W_, H_, d);
+                }
+            }
+            fflush(stderr);
+            dup2(saved, STDERR_FILENO);
+            close(saved);
+            if (in_buf) free(in_buf);
+            DetResult res;
+            res.dets = std::move(nms_dets);
+            res.frame_id = task.frame_id;
+            q_det_result_.push_drop_oldest(std::move(res));
+        }
+    }
+};
+
+
 
 static double timespec_diff_ms(const struct timespec& a, const struct timespec& b) {
     return (a.tv_sec - b.tv_sec) * 1000.0 + (a.tv_nsec - b.tv_nsec) / 1e6;
@@ -487,19 +565,14 @@ int main(int argc, char** argv) {
     if (argc > 7) YOLO_CONF_THRESH = atof(argv[7]);
     if (argc > 8) YOLO_IOU_THRESH = atof(argv[8]);
     if (argc > 9) OD_SKIP = atoi(argv[9]);  // 每 N 帧做一次 OD, 1=每帧, 3=每 3 帧
-    // 2026-08-17: argv 10 是模型类型: "yolov8" 或 "yolov5" (默认 yolov5)
-    // yolov8 模式跳 yolov5_post_process_bgr (它写死处理 3 outputs), 改走 yolov8_decode
-    bool is_yolov8 = false;
-    if (argc > 10 && strcmp(argv[10], "yolov8") == 0) is_yolov8 = true;
 
     printf("=== v31 ALL-C++ V4L2 + OD + RTSP (debug version) ===\n");
     printf("  dev=%s  res=%dx%d  n_bufs=%d  duration=%ds\n", dev, W, H, N_BUFS, DURATION_S);
     printf("  model=%s\n", model_path);
-    printf("  yolo: mode=%s conf=%.2f iou=%.2f od_skip=%d\n\n",
-           is_yolov8 ? "yolov8" : "yolov5", YOLO_CONF_THRESH, YOLO_IOU_THRESH, OD_SKIP);
+    printf("  yolo: conf=%.2f iou=%.2f od_skip=%d\n\n", YOLO_CONF_THRESH, YOLO_IOU_THRESH, OD_SKIP);
     // 2026-08-13 fix: SDP framerate 跟实际板端稳态输出匹配 (实际 ~14 FPS cumulative, 稳态 10 FPS).
     // 之前 30 FPS 误导 PC 端 mpv/VLC 按 30 FPS 设计 buffer, 实际 14 FPS 时 buffer 永远吃不满, 任何 spike 都直接体现在画面上.
-    g_state.W = W; g_state.H = H; g_state.FPS = 14;
+    g_state.W = W; g_state.H = H; g_state.FPS = 30;  // 2026-10-11: 架构 A 上线后 camera ceiling 30fps, SDP/caps 跟实际匹配
 
     // 1. Load libod_helper.so
     void* h = dlopen("/home/radxa/od_api/lib/libod_helper.so", RTLD_NOW | RTLD_GLOBAL);
@@ -534,11 +607,11 @@ int main(int argc, char** argv) {
 // 不在 capsfilter 强制 level (8-13 试过 level=3.0 但 x264 实际 SPS level 跟它不一致, pipeline not-negotiated -4 -> 503).
 // 只设 profile (constrained-baseline), 让 x264 自己选合适的 level (跟 SPS 匹配).
     gst_rtsp_media_factory_set_launch(factory,
-        "( appsrc name=mysrc caps=\"video/x-raw,format=BGR,width=640,height=480,framerate=14/1\" "
+        "( appsrc name=mysrc caps=\"video/x-raw,format=BGR,width=640,height=480,framerate=30/1\" "
         "! videoconvert "
-        "! capsfilter caps=\"video/x-raw,format=I420,width=640,height=480,framerate=14/1\" "
+        "! capsfilter caps=\"video/x-raw,format=I420,width=640,height=480,framerate=30/1\" "
         "! x264enc ! h264parse "
-        "! capsfilter caps=\"video/x-h264,framerate=14/1,profile=constrained-baseline\" "
+        "! capsfilter caps=\"video/x-h264,framerate=30/1,profile=constrained-baseline\" "
         "! rtph264pay name=pay0 pt=96 config-interval=1 "
         ")");
     gst_rtsp_media_factory_set_shared(factory, TRUE);
@@ -598,6 +671,15 @@ int main(int argc, char** argv) {
     int stderr_fd = mkstemp(stderr_file);
     close(stderr_fd);
 
+    // === 架构 A: 启动 OD worker (clone bgr ~0.5ms, 接受小开销换 main 不等 OD) ===
+    DetectorWorker worker(ctx, W, H, stderr_file,
+                          yolov5_pre_process_bgr, yolov5_post_process_bgr,
+                          awnn_set_input_buffers, awnn_run, awnn_get_output_buffers,
+                          /*q_frame_max=*/2);
+    worker.start();
+    DetResult last_det;
+    uint64_t frame_id = 0;
+
     // 7. Main loop
     int count = 0;
     int total_dets = 0;
@@ -623,29 +705,38 @@ int main(int argc, char** argv) {
         clock_gettime(CLOCK_MONOTONIC, &t_dq);
         cv::Mat yuyv_mat(H, W, CV_8UC2, bufs[buf.index]);
         cv::Mat bgr;
-        cv::cvtColor(yuyv_mat, bgr, cv::COLOR_YUV2BGR_YUYV);
+        // 2026-08-13 debug: 每 30 帧 (~2s) 保存 yuv 原始
 
-        // 2026-08-13 debug: 每 30 帧 (约 2s) 保存一帧
-        // 1. /tmp/v31_last.yuv - 原始 YUYV (从 /dev/video0, 422 格式)
-        //    播放: ffplay -f rawvideo -pix_fmt yuyv422 -video_size 640x480 /tmp/v31_last.yuv
-        // 2. /tmp/v31_raw.jpg - 原始 BGR (未画框, 给参考)
+        // === 架构 A: 异步 OD (clone bgr 0.5ms, 保证 main 不等 OD) ===
+        clock_gettime(CLOCK_MONOTONIC, &t_cvt);
+        cv::cvtColor(yuyv_mat, bgr, cv::COLOR_YUV2BGR_YUYV);
+        // 1. clone bgr 推给 worker (避免 main 改写)
+        FrameTask task;
+        task.bgr = std::make_shared<cv::Mat>(bgr.clone());
+        task.frame_id = frame_id++;
+        worker.q_frame().push_drop_oldest(std::move(task));
+        // 2. pop latest det from worker (non-blocking)
+        DetResult new_det;
+        if (worker.q_det_result().try_pop_latest(new_det)) {
+            last_det = std::move(new_det);
+        }
+        // raw.jpg dump (改框前)
         if ((count % 30) == 0) {
-            FILE* fy = fopen("/tmp/v31_last.yuv", "wb");
-            if (fy) { fwrite(bufs[buf.index], 1, W*H*2, fy); fclose(fy); }
             std::vector<uchar> jpeg_buf;
             cv::imencode(".jpg", bgr, jpeg_buf);
             FILE* fj = fopen("/tmp/v31_raw.jpg", "wb");
             if (fj) { fwrite(jpeg_buf.data(), 1, jpeg_buf.size(), fj); fclose(fj); }
         }
-
-        // OD
-        clock_gettime(CLOCK_MONOTONIC, &t_cvt);
-        unsigned int in_size = 0;
-        fflush(stderr);
-        int saved = dup(STDERR_FILENO);
-        int tmp_fd = open(stderr_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        dup2(tmp_fd, STDERR_FILENO);
-        close(tmp_fd);
+        // 3. draw last_det on current bgr (1 frame latency ~33ms)
+        draw_detections(bgr, last_det.dets);
+        // /tmp/v31_last.jpg dump 用 draw 完的 bgr (改框后)
+        if ((count % 30) == 0) {
+            std::vector<uchar> jpeg_buf;
+            cv::imencode(".jpg", bgr, jpeg_buf);
+            FILE* fj = fopen("/tmp/v31_last.jpg", "wb");
+            if (fj) { fwrite(jpeg_buf.data(), 1, jpeg_buf.size(), fj); fclose(fj); }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_od);
         // 2026-08-12 优化卡顿: NPU 推理中位数 32ms 是 FPS 卡顿主因。
         // 每 3 帧做一次 OD, 每帧都 push appsrc -> 板端 FPS 14 -> 23+,
         // spike 减少, PC 端 VLC 不再连续卡顿.
@@ -660,164 +751,7 @@ int main(int argc, char** argv) {
         //   -> volatile 让 fetch_add 不能被优化
         //   -> 普通 int 自增在 main thread 单线程下, 比 std::atomic 简单可靠
         //   -> 但运行时仍然 od=21ms 每帧 (debug print 在 postproc 里, 只看到 OD 帧)
-        static volatile int od_counter = 0;
-        int od_c = od_counter++;
-        int det_count = 0;
-        // 2026-08-14: OD_SKIP 参数控制 OD 频率 (默认 1=每帧, 为画框稳定不闪烁)
-        if ((od_c % OD_SKIP) == 0) {
-            void* in_buf = yolov5_pre_process_bgr(bgr.data, W, H, &in_size);
-            if (in_buf) {
-                void* ib = in_buf;
-                awnn_set_input_buffers(ctx, &ib);
-                awnn_run(ctx);
-                void** outputs = awnn_get_output_buffers(ctx);
-                if (outputs) {
-                    std::vector<DetBox> all_dets, nms_dets;
-                    // 2026-08-17: yolov8 模式跳 yolov5_post_process_bgr (写死 3 outputs) + yolov5_decode_all
-                    //   yolov5 模式: 调 libod_helper (会写 "detection num: N" 到 stderr) + 走 yolov5 decode
-                    //   yolov8 模式: 不调 libod_helper, 直接用 yolov8_decode_all 解析单 output0
-                    if (is_yolov8) {
-                        yolov8_decode_all(outputs, W, H, all_dets);
-                        yolov5_nms(all_dets, nms_dets);  // 复用现有 NMS (DetBox 兼容)
-                        det_count = (int)nms_dets.size();
-                    } else {
-                    // 2026-08-14 fix: 新 yolov5.nb 是 640x640 input, grid [80, 40, 20]
-                    // (之前 416x416 [52, 26, 13] 模型 obj head 损坏已替换)
-                    // YOLOv5 output layout per anchor: [x, y, w, h, obj, cls0, cls1, ..., cls79] = 85
-                    // 临时调试: 看 person/car logit 最大
-                    if ((count % 30) == 1) {
-                        float person_max = -1e9f, car_max = -1e9f;
-                        for (int s = 0; s < 3; s++) {
-                            int gs = (s==0)?80:(s==1)?40:20;
-                            float* out = (float*)outputs[s];
-                            for (int a = 0; a < gs*gs*3; a++) {
-                                float* anch = out + a*85;
-                                if (anch[5] > person_max) person_max = anch[5];  // cls 0 = person
-                                if (anch[7] > car_max) car_max = anch[7];  // cls 2 = car
-                            }
-                        }
-                        fprintf(stderr, "[NPU] person_logit=%.3f(%.0f%%) car_logit=%.3f(%.0f%%)\n",
-                                person_max, 1.0f/(1.0f+expf(-person_max))*100,
-                                car_max, 1.0f/(1.0f+expf(-car_max))*100);
-                    }
-                    yolov5_post_process_bgr(outputs, W, H);
-                    fflush(stderr);  // 2026-08-13 fix: stderr 被 dup2 到 file 后变全缓冲, 必须 fflush 才能写到 stderr_file 让 parser 读到
-                    std::vector<std::tuple<int,int,int,int,float,std::string>> dets;
-                    det_count = parse_detections_from_stderr(stderr_file, dets);
-                    // 2026-08-14: 自己 decode + NMS + letterbox_inverse + draw (libod_helper 只输出 count)
-                    yolov5_decode_all(outputs, W, H, all_dets);
-                    yolov5_nms(all_dets, nms_dets);
-                    }  // end is_yolov8 else
-                    // 2026-08-14 v35: edge filter 在 letterbox_inverse 里标记 score=-1
-                    std::vector<DetBox> filtered_dets;
-                    for (auto& d : nms_dets) {
-                        letterbox_inverse(W, H, d);
-                        if (d.score >= 0.0f) filtered_dets.push_back(d);  // score=-1 = reject
-                    }
-                    // 2026-08-14 23:05 v35.1: top-K box 限制 (按 conf 降序, 只画前 N 个最强)
-                    // 避免误识别太多同时保留真人
-                    std::sort(filtered_dets.begin(), filtered_dets.end(),
-                              [](const DetBox& a, const DetBox& b) { return a.score > b.score; });
-                    if ((int)filtered_dets.size() > MAX_BOX_PER_FRAME) {
-                        filtered_dets.resize(MAX_BOX_PER_FRAME);
-                    }
-                    // 2026-08-15 v38: 5 帧 temporal voting 过滤
-                    // 真人持续在同一位置 → hit_count >= 3 通过
-                    // 假阳性随机 → hit_count < 3 过滤
-                    if (!filtered_dets.empty()) {
-                        const DetBox& cur = filtered_dets[0];
-                        float cx = (cur.x1 + cur.x2) / 2.0f;
-                        float cy = (cur.y1 + cur.y2) / 2.0f;
-                        static struct { float cx, cy; int hit_count, last_seen_frame; } tracks[TEMPORAL_TRACKS] = {};
-                        static int frame_idx = 0;
-                        frame_idx++;
-                        // 老化: 超 TEMPORAL_WINDOW 帧没出现 → 清零
-                        for (int i = 0; i < TEMPORAL_TRACKS; i++) {
-                            if (tracks[i].last_seen_frame > 0 &&
-                                frame_idx - tracks[i].last_seen_frame > TEMPORAL_WINDOW) {
-                                tracks[i].hit_count = 0;
-                                tracks[i].last_seen_frame = 0;
-                                tracks[i].cx = tracks[i].cy = 0;
-                            }
-                        }
-                        // 匹配现有 track
-                        int best = -1;
-                        float best_d2 = TEMPORAL_MAX_DIST * TEMPORAL_MAX_DIST;
-                        for (int i = 0; i < TEMPORAL_TRACKS; i++) {
-                            if (tracks[i].last_seen_frame == 0) continue;
-                            float dx = tracks[i].cx - cx;
-                            float dy = tracks[i].cy - cy;
-                            float d2 = dx*dx + dy*dy;
-                            if (d2 < best_d2) { best_d2 = d2; best = i; }
-                        }
-                        if (best >= 0) {
-                            // 更新平滑位置 (EMA 0.7)
-                            tracks[best].cx = 0.7f * tracks[best].cx + 0.3f * cx;
-                            tracks[best].cy = 0.7f * tracks[best].cy + 0.3f * cy;
-                            tracks[best].last_seen_frame = frame_idx;
-                            if (tracks[best].hit_count < TEMPORAL_WINDOW) tracks[best].hit_count++;
-                        } else {
-                            // 新 track (找空位)
-                            for (int i = 0; i < TEMPORAL_TRACKS; i++) {
-                                if (tracks[i].last_seen_frame == 0) {
-                                    tracks[i].cx = cx; tracks[i].cy = cy;
-                                    tracks[i].hit_count = 1;
-                                    tracks[i].last_seen_frame = frame_idx;
-                                    best = i;
-                                    break;
-                                }
-                            }
-                        }
-                        // 检查当前 box 对应的 track 是否够票
-                        bool passes = false;
-                        if (best >= 0 && tracks[best].hit_count >= TEMPORAL_VOTES) {
-                            passes = true;
-                        }
-                        if (!passes) filtered_dets.clear();  // 不够票, 不画
-                        // DEBUG
-                        if ((count % 30) == 1) {
-                            fprintf(stderr, "[TEMP] frame=%d top1=(%.0f,%.0f) hits=%d/%d pass=%d\n",
-                                    frame_idx, cx, cy,
-                                    best >= 0 ? tracks[best].hit_count : 0,
-                                    TEMPORAL_WINDOW, passes ? 1 : 0);
-                        }
-                    }
-                    draw_detections(bgr, filtered_dets, is_yolov8);
-                    // 2026-08-14 debug: 每 30 帧保存一帧带框版 (用于诊断/分享)
-                    if ((count % 30) == 0) {
-                        std::vector<uchar> jpeg_buf;
-                        cv::imencode(".jpg", bgr, jpeg_buf);
-                        FILE* fj = fopen("/tmp/v31_last.jpg", "wb");
-                        if (fj) { fwrite(jpeg_buf.data(), 1, jpeg_buf.size(), fj); fclose(fj); }
-                    }
-                    // 2026-08-15 v38 DEBUG: 框位置不准调查 - 输出 top-3 box (letterbox 后)
-                    // 在 OD 块内写到 stderr (会到 file), 移到块外才能看 journal
-                    if ((count % 30) == 1 && !filtered_dets.empty()) {
-                        std::vector<DetBox> tmp = filtered_dets;
-                        std::sort(tmp.begin(), tmp.end(),
-                                  [](const DetBox& a, const DetBox& b) { return a.score > b.score; });
-                        printf("[BOXES] after_filter=%d top%d:", (int)tmp.size(),
-                               std::min(3, (int)tmp.size()));
-                        for (int i = 0; i < std::min(3, (int)tmp.size()); i++) {
-                            printf(" #%d cls=%d sc=%.2f [%.0f,%.0f,%.0f,%.0f] center(%.0f,%.0f)", i,
-                                   tmp[i].class_id, tmp[i].score,
-                                   tmp[i].x1, tmp[i].y1, tmp[i].x2, tmp[i].y2,
-                                   (tmp[i].x1+tmp[i].x2)/2, (tmp[i].y1+tmp[i].y2)/2);
-                        }
-                        printf("\n");
-                    }
-                }
-            }
-            fflush(stderr);
-            dup2(saved, STDERR_FILENO);
-            close(saved);
-            if (in_buf) free(in_buf);
-        } else {
-            fflush(stderr);
-            dup2(saved, STDERR_FILENO);
-            close(saved);
-        }
-        clock_gettime(CLOCK_MONOTONIC, &t_od);
+
 
         // Push to appsrc: use gst_buffer_new_and_alloc + fill + always unref
         // 2026-08-09: 仅在 appsrc_wants_data 时推 (避免 preroll 503 + queue 爆炸)
@@ -860,7 +794,7 @@ int main(int argc, char** argv) {
         clock_gettime(CLOCK_MONOTONIC, &t_qb);
 
         count++;
-        total_dets += det_count;
+        // total_dets += det_count; // 2026-10-11 架构 A: main 不再累计 det
 
         struct timespec t_now;
         clock_gettime(CLOCK_MONOTONIC, &t_now);
@@ -883,6 +817,7 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
+    worker.stop();  // 2026-10-11 架构 A: 等 worker 算完最后一帧, 避免 race
     ioctl(fd, VIDIOC_STREAMOFF, &type);
     for (int i = 0; i < N_BUFS; i++) munmap(bufs[i], buf_lens[i]);
     close(fd);
